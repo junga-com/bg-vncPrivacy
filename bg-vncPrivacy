@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""bg-vncPrivacy: keep the local monitor dark while working over VNC.
+
+"Privacy on" switches the monitor (over DDC/CI) to an unused input, so it shows
+nothing no matter what the desktop does. "Privacy off" switches it back.
+
+Subcommands
+  vncSessionStart  x11vnc -afteraccept hook. Counts a VNC client in; on the
+                   first one, turns privacy on if the local monitor is off, so
+                   working remotely does not light it up.
+  vncSessionEnd    x11vnc -gone hook. Counts a VNC client out; after the last
+                   one, if privacy is on: locks the screen, powers the display
+                   off and switches the monitor back to its desk input.
+  tray             Top-bar item (shown only while a VNC session is active):
+                   menu with status and an on/off item; double- or
+                   middle-click toggles.
+  on | off | toggle  Switch privacy by hand ("off" is the rescue command if the
+                   monitor is stuck on the unused input).
+  status           Print the current state.
+
+State lives in $XDG_RUNTIME_DIR/bg-vncPrivacy (or /run/user/UID/bg-vncPrivacy);
+settings in /etc/bg-vncPrivacy.conf.
+"""
+import configparser
+import contextlib
+import fcntl
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+UID = os.getuid()
+# x11vnc hooks run without a session environment.
+os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{UID}/bus")
+
+from gi.repository import Gio, GLib  # noqa: E402
+
+CONF_FILE = "/etc/bg-vncPrivacy.conf"
+ICON_DIR = "/usr/local/share/bg-vncPrivacy/icons"
+# Top-bar icons: monitor plus "VNC Privacy". The AppIndicator extension only
+# draws wide icons at their natural width when the file is in a user-writable
+# directory, so the tray copies them into the state directory.
+PANEL_ICON = "bg-vncprivacy-panel"
+PANEL_ICON_PRIVATE = "bg-vncprivacy-panel-off"
+# Small icons for the menu's status line.
+MENU_ICON_ON = "bg-vncprivacy-monitor-symbolic"
+MENU_ICON_OFF = "bg-vncprivacy-monitor-off-symbolic"
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{UID}",
+                         "bg-vncPrivacy")
+STATUS_ID = 3
+POLL_SECONDS = 2
+
+
+def load_config():
+    cp = configparser.ConfigParser()
+    cp.read_dict({
+        "monitor": {"serial": "", "desk_input": "0x19", "private_input": "0x11"},
+        "vnc": {"port": "5900"},
+    })
+    cp.read(CONF_FILE)
+    return cp
+
+
+CONF = load_config()
+
+
+def log(msg):
+    print(f"bg-vncPrivacy[{os.getpid()}]: {msg}", file=sys.stderr, flush=True)
+
+
+# --- state ------------------------------------------------------------------
+
+def _path(name):
+    return os.path.join(STATE_DIR, name)
+
+
+def _read(name, default=""):
+    try:
+        with open(_path(name)) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def _write(name, value):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = _path(f".{name}.tmp")
+    with open(tmp, "w") as f:
+        f.write(f"{value}\n")
+    os.replace(tmp, _path(name))
+
+
+def read_state():
+    """(sessions, privacy_on, last_error)"""
+    try:
+        sessions = int(_read("sessions", "0") or 0)
+    except ValueError:
+        sessions = 0
+    return sessions, _read("privacy") == "on", _read("error")
+
+
+@contextlib.contextmanager
+def state_lock():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(_path(".lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+# --- monitor and session ----------------------------------------------------
+
+def ddc_set_input(value):
+    """Switch the monitor's input (VCP 0x60). Returns an error string or ""."""
+    serial = CONF["monitor"]["serial"]
+    cmd = ["ddcutil"] + (["--sn", serial] if serial else []) + ["setvcp", "60", value]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"ddcutil: {e}"
+    if r.returncode:
+        lines = (r.stderr or r.stdout).strip().splitlines()
+        return lines[-1] if lines else f"ddcutil exited {r.returncode}"
+    return ""
+
+
+def vnc_clients():
+    port = CONF["vnc"]["port"]
+    try:
+        out = subprocess.run(["ss", "-Htn", "state", "established", f"( sport = :{port} )"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return sum(1 for line in out.splitlines() if line.strip())
+
+
+def _bus():
+    try:
+        return Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except GLib.Error:
+        return None
+
+
+def _call(bus, name, path, iface, method, args=None, rtype=None):
+    return bus.call_sync(name, path, iface, method, args,
+                         GLib.VariantType(rtype) if rtype else None,
+                         Gio.DBusCallFlags.NONE, 5000, None)
+
+
+MUTTER = ("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig")
+SCREENSAVER = ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver")
+
+
+def monitor_is_off():
+    """True if the desktop has the display blanked or powered down, False if it
+    is showing, None if there is no GNOME session to ask (e.g. login screen)."""
+    bus = _bus()
+    if bus is None:
+        return None
+    try:
+        mode = _call(bus, *MUTTER, "org.freedesktop.DBus.Properties", "Get",
+                     GLib.Variant("(ss)", (MUTTER[0], "PowerSaveMode")), "(v)").unpack()[0]
+        blanked = _call(bus, *SCREENSAVER, "GetActive", None, "(b)").unpack()[0]
+    except GLib.Error:
+        return None
+    return mode != 0 or blanked
+
+
+def lock_and_power_off():
+    bus = _bus()
+    if bus is None:
+        return
+    steps = (
+        ("lock screen", lambda: _call(bus, *SCREENSAVER, "Lock")),
+        ("power off display", lambda: _call(
+            bus, *MUTTER, "org.freedesktop.DBus.Properties", "Set",
+            GLib.Variant("(ssv)", (MUTTER[0], "PowerSaveMode", GLib.Variant("i", 3))))),
+    )
+    for desc, step in steps:
+        try:
+            step()
+        except GLib.Error as e:
+            log(f"{desc} failed: {e.message}")
+
+
+def _set_privacy(on):
+    """Switch the monitor input and record the result. Caller holds state_lock."""
+    err = ddc_set_input(CONF["monitor"]["private_input" if on else "desk_input"])
+    _write("error", err)
+    if err:
+        log(f"switching monitor input failed: {err}")
+        return False
+    _write("privacy", "on" if on else "off")
+    log(f"privacy {'on' if on else 'off'}")
+    return True
+
+
+def session_start():
+    with state_lock():
+        sessions, privacy, _ = read_state()
+        _write("sessions", sessions + 1)
+        if sessions == 0 and not privacy:
+            off = monitor_is_off()
+            log("first VNC session; local monitor is "
+                + {True: "off", False: "on", None: "unknown"}[off])
+            if off:
+                _set_privacy(True)
+
+
+def session_end(all_sessions=False):
+    with state_lock():
+        sessions, privacy, _ = read_state()
+        sessions = 0 if all_sessions else max(0, sessions - 1)
+        _write("sessions", sessions)
+        if sessions == 0 and privacy:
+            log("last VNC session ended with privacy on: locking, display off, input back")
+            lock_and_power_off()
+            time.sleep(1)
+            _set_privacy(False)
+
+
+def set_privacy(on, require_session=True):
+    with state_lock():
+        sessions, _, _ = read_state()
+        if on and require_session and sessions == 0:
+            log("no active VNC session; leaving privacy off")
+            return False
+        return _set_privacy(on)
+
+
+# --- tray -------------------------------------------------------------------
+
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+    <method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+    <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+    <method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
+    <signal name="NewIcon"/>
+    <signal name="NewTitle"/>
+    <signal name="NewStatus"><arg type="s"/></signal>
+  </interface>
+</node>"""
+
+MENU_XML = """
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <property name="Version" type="u" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
+    <method name="GetLayout">
+      <arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
+      <arg type="u" direction="out"/><arg type="(ia{sv}av)" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg type="ai" direction="in"/><arg type="as" direction="in"/>
+      <arg type="a(ia{sv})" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg type="i" direction="in"/><arg type="s" direction="in"/>
+      <arg type="v" direction="in"/><arg type="u" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg type="a(isvu)" direction="in"/><arg type="ai" direction="out"/>
+    </method>
+    <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+    <method name="AboutToShowGroup">
+      <arg type="ai" direction="in"/><arg type="ai" direction="out"/><arg type="ai" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg type="a(ia{sv})"/><arg type="a(ias)"/>
+    </signal>
+    <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+  </interface>
+</node>"""
+
+def png_icon(name, size=16):
+    """PNG bytes of one of our SVG icons (dbusmenu takes PNG icon-data), or None."""
+    try:
+        import gi
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(
+            os.path.join(ICON_DIR, f"{name}.svg"), size, size)
+        ok, data = pixbuf.save_to_bufferv("png", [], [])
+        return bytes(data) if ok else None
+    except (ImportError, ValueError, GLib.Error) as e:
+        log(f"menu icon {name}: {e}")
+        return None
+
+
+SNI_PATH = "/StatusNotifierItem"
+MENU_PATH = "/MenuBar"
+TOGGLE_ID = 10
+
+
+class Tray:
+    def __init__(self, bus):
+        self.bus = bus
+        self.busy = False
+        self.missing_polls = 0
+        self.revision = 1
+        self.view = None
+        self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        self.icon_dir = os.path.join(STATE_DIR, "icons")
+        os.makedirs(self.icon_dir, exist_ok=True)
+        for name in (PANEL_ICON, PANEL_ICON_PRIVATE):
+            shutil.copy(os.path.join(ICON_DIR, f"{name}.svg"), self.icon_dir)
+        self.menu_icons = {on: png_icon(MENU_ICON_ON if on else MENU_ICON_OFF)
+                           for on in (True, False)}
+
+        sni = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        menu = Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0]
+        bus.register_object(SNI_PATH, sni, self._sni_method, self._sni_property, None)
+        bus.register_object(MENU_PATH, menu, self._menu_method, self._menu_property, None)
+        _call(bus, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+              "RequestName", GLib.Variant("(su)", (self.name, 4)), "(u)")
+        Gio.bus_watch_name_on_connection(bus, "org.kde.StatusNotifierWatcher",
+                                         Gio.BusNameWatcherFlags.NONE, self._register, None)
+
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.dir_monitor = Gio.File.new_for_path(STATE_DIR).monitor_directory(
+            Gio.FileMonitorFlags.NONE, None)
+        self.dir_monitor.connect("changed", self._on_state_file)
+        GLib.timeout_add_seconds(POLL_SECONDS, self._poll)
+        self.refresh()
+
+    # what to show
+    def _compute(self):
+        sessions, privacy, error = read_state()
+        if privacy:
+            monitor = "off"
+        else:
+            off = monitor_is_off()
+            monitor = {True: "off", False: "on", None: "unknown"}[off]
+        return {
+            "status": "Active" if sessions > 0 else "Passive",
+            "icon": PANEL_ICON_PRIVATE if privacy else PANEL_ICON,
+            "monitor": monitor,
+            "privacy": privacy,
+            "error": error,
+            "busy": self.busy,
+        }
+
+    def refresh(self):
+        view = self._compute()
+        old, self.view = self.view, view
+        if old is None:
+            return
+        if view["status"] != old["status"]:
+            self.bus.emit_signal(None, SNI_PATH, "org.kde.StatusNotifierItem", "NewStatus",
+                                 GLib.Variant("(s)", (view["status"],)))
+        if view["icon"] != old["icon"]:
+            self.bus.emit_signal(None, SNI_PATH, "org.kde.StatusNotifierItem", "NewIcon", None)
+        if view != old:
+            self.revision += 1
+            self.bus.emit_signal(None, MENU_PATH, "com.canonical.dbusmenu", "LayoutUpdated",
+                                 GLib.Variant("(ui)", (self.revision, 0)))
+
+    # StatusNotifierItem
+    def _register(self, *_):
+        self.bus.call(
+            "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+            "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+            GLib.Variant("(s)", (self.name,)), None, Gio.DBusCallFlags.NONE, -1, None, None)
+
+    def _sni_property(self, _conn, _sender, _path, _iface, prop):
+        v = self.view
+        values = {
+            "Category": ("s", "Hardware"),
+            "Id": ("s", "bg-vncPrivacy"),
+            "Title": ("s", "bg-vncPrivacy"),
+            "Status": ("s", v["status"]),
+            "IconName": ("s", v["icon"]),
+            "IconThemePath": ("s", self.icon_dir),
+            "ItemIsMenu": ("b", False),
+            "Menu": ("o", MENU_PATH),
+        }
+        if prop in values:
+            return GLib.Variant(*values[prop])
+        return None
+
+    def _sni_method(self, _conn, _sender, _path, _iface, method, _params, invocation):
+        if method in ("Activate", "SecondaryActivate"):
+            self.toggle()
+        invocation.return_value(None)
+
+    # dbusmenu
+    def _items(self):
+        v = self.view
+        def label(text, enabled=False):
+            return {"label": GLib.Variant("s", text), "enabled": GLib.Variant("b", enabled)}
+        # The status line is enabled (not greyed like the others), says ON/OFF
+        # in capitals and carries the matching monitor icon so it stands out.
+        status = label(f"Local physical monitor is {v['monitor'].upper()}", enabled=True)
+        icon = self.menu_icons.get(v["monitor"] == "on")
+        if icon:
+            status["icon-data"] = GLib.Variant("ay", icon)
+        items = [
+            (1, label("bg-vncPrivacy:")),
+            (2, label("A remote session is active")),
+            (STATUS_ID, status),
+        ]
+        if v["error"]:
+            items.append((4, label(f"Error: {v['error']}")))
+        items.append((5, {"type": GLib.Variant("s", "separator")}))
+        toggle = "Turn local monitor on" if v["privacy"] else "Turn local monitor off"
+        if v["busy"]:
+            toggle = "Switching…"
+        items.append((TOGGLE_ID, label(toggle, enabled=not v["busy"])))
+        return items
+
+    def _layout(self):
+        children = [GLib.Variant("(ia{sv}av)", (i, props, [])) for i, props in self._items()]
+        return (0, {"children-display": GLib.Variant("s", "submenu")}, children)
+
+    def _menu_property(self, _conn, _sender, _path, _iface, prop):
+        return {
+            "Version": GLib.Variant("u", 3),
+            "TextDirection": GLib.Variant("s", "ltr"),
+            "Status": GLib.Variant("s", "normal"),
+            "IconThemePath": GLib.Variant("as", [ICON_DIR]),
+        }.get(prop)
+
+    def _menu_method(self, _conn, _sender, _path, _iface, method, params, invocation):
+        if method == "GetLayout":
+            invocation.return_value(GLib.Variant("(u(ia{sv}av))", (self.revision, self._layout())))
+        elif method == "GetGroupProperties":
+            ids = params.unpack()[0]
+            items = [(i, p) for i, p in self._items() if not ids or i in ids]
+            invocation.return_value(GLib.Variant("(a(ia{sv}))", (items,)))
+        elif method == "GetProperty":
+            item_id, name = params.unpack()
+            props = dict(self._items()).get(item_id, {})
+            if name in props:
+                invocation.return_value(GLib.Variant("(v)", (props[name],)))
+            else:
+                invocation.return_dbus_error("com.canonical.dbusmenu.Error", "no such property")
+        elif method == "Event":
+            item_id, event = params.unpack()[:2]
+            if item_id == TOGGLE_ID and event == "clicked":
+                self.toggle()
+            invocation.return_value(None)
+        elif method == "EventGroup":
+            for item_id, event, _data, _ts in params.unpack()[0]:
+                if item_id == TOGGLE_ID and event == "clicked":
+                    self.toggle()
+            invocation.return_value(GLib.Variant("(ai)", ([],)))
+        elif method == "AboutToShow":
+            self.refresh()
+            invocation.return_value(GLib.Variant("(b)", (False,)))
+        elif method == "AboutToShowGroup":
+            invocation.return_value(GLib.Variant("(aiai)", ([], [])))
+
+    # actions
+    def _in_background(self, work):
+        self.busy = True
+        self.refresh()
+
+        def run():
+            try:
+                work()
+            except Exception as e:  # keep the tray alive
+                log(f"action failed: {e!r}")
+            finally:
+                GLib.idle_add(self._done)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _done(self):
+        self.busy = False
+        self.refresh()
+        return False
+
+    def toggle(self):
+        sessions, privacy, _ = read_state()
+        if self.busy or sessions == 0:
+            return
+        self._in_background(lambda: set_privacy(not privacy))
+
+    def _on_state_file(self, _monitor, file, _other, _event):
+        if file.get_basename() in ("sessions", "privacy", "error"):
+            self.refresh()
+
+    def _poll(self):
+        # Backup for missed -gone hooks (x11vnc restarted, X server replaced, ...).
+        sessions, _, _ = read_state()
+        clients = vnc_clients()
+        if sessions > 0 and clients == 0:
+            self.missing_polls += 1
+            if self.missing_polls >= 2 and not self.busy:
+                log("VNC clients gone without vncSessionEnd; cleaning up")
+                self.missing_polls = 0
+                self._in_background(lambda: session_end(all_sessions=True))
+        else:
+            self.missing_polls = 0
+        self.refresh()
+        return True
+
+
+def run_tray():
+    bus = _bus()
+    if bus is None:
+        log("no session bus")
+        return 1
+    # one tray per session
+    reply = _call(bus, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                  "RequestName", GLib.Variant("(su)", ("local.bgVncPrivacy.Tray", 4)), "(u)")
+    if reply.unpack()[0] != 1:
+        log("tray already running")
+        return 0
+    Tray(bus)
+    GLib.MainLoop().run()
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "tray"
+    hooks = {"vncSessionStart": session_start, "vncSessionEnd": session_end}
+    if cmd in hooks:
+        try:
+            hooks[cmd]()
+        except Exception as e:  # never fail the x11vnc hook
+            log(f"{cmd} failed: {e!r}")
+        return 0
+    if cmd == "tray":
+        return run_tray()
+    if cmd in ("on", "off", "toggle"):
+        _, privacy, _ = read_state()
+        on = {"on": True, "off": False, "toggle": not privacy}[cmd]
+        # "off" always works, so it can rescue a monitor stuck on the private input.
+        return 0 if set_privacy(on, require_session=(cmd != "off")) else 1
+    if cmd == "status":
+        sessions, privacy, error = read_state()
+        off = monitor_is_off()
+        print(f"VNC sessions:  {sessions} (ss sees {vnc_clients()})")
+        print(f"privacy:       {'on' if privacy else 'off'}")
+        print(f"desktop says monitor is: {({True: 'off', False: 'on', None: 'unknown'})[off]}")
+        if error:
+            print(f"last error:    {error}")
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

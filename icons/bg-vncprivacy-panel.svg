@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="16" viewBox="0 0 96 16">
+  <path fill="#ffffff" fill-rule="evenodd" d="M1 2h14v10H1z M2.5 3.5v7h11v-7z"/>
+  <path fill="#ffffff" d="M7 12h2v1.5H7z M4.5 13.5h7V15h-7z"/>
+  
+  <text x="20" y="12.5" fill="#ffffff" font-family="Ubuntu, DejaVu Sans, sans-serif" font-size="12" textLength="74" lengthAdjust="spacingAndGlyphs">VNC Privacy</text>
+</svg>

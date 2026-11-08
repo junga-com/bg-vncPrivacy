@@ -1,0 +1,111 @@
+.TH BG-VNCPRIVACY 1 "November 2026" "bg-vncPrivacy" "User Commands"
+.SH NAME
+bg-vncPrivacy \- keep the local monitor dark while working over VNC
+.SH SYNOPSIS
+.B bg-vncPrivacy
+.RI [ command ]
+.SH DESCRIPTION
+.B bg-vncPrivacy
+hides the desktop from anyone at the physical monitor while you work on it
+over VNC.
+.I Privacy on
+switches the monitor, over DDC/CI, to an input with nothing connected, so it
+shows nothing whatever the desktop does.
+.I Privacy off
+switches it back to the input this computer is connected to.
+.PP
+x11vnc calls the program when VNC clients connect and disconnect. If the local
+monitor is off when the first client connects, privacy turns on, so working
+remotely does not light it up. When the last client disconnects with privacy
+on, the screen is locked, the display powered down and the monitor switched
+back, so it stays off. With privacy off, connecting and disconnecting leave
+the monitor alone.
+.PP
+While a VNC session is active, a
+.B VNC Privacy
+item (monitor icon, slashed while privacy is on) appears in the top bar. A
+single click opens a menu with the current state and a
+.I Turn local monitor on/off
+item. A double- or middle-click toggles directly.
+.SH COMMANDS
+.TP
+.B tray
+Run the top-bar item (the default). Started at desktop login by
+.IR /etc/xdg/autostart/bg-vncPrivacy.desktop .
+Only one runs per session.
+.TP
+.B vncSessionStart
+x11vnc
+.B \-afteraccept
+hook. Counts a client in. For the first client, turns privacy on if the
+desktop reports the display blanked or powered down.
+.TP
+.B vncSessionEnd
+x11vnc
+.B \-gone
+hook. Counts a client out. After the last client, if privacy is on, locks the
+screen, powers the display down and switches the monitor back.
+.TP
+.B on
+Turn privacy on (only while a VNC session is active).
+.TP
+.B off
+Turn privacy off. Always switches the monitor back, so it also rescues a
+monitor left on the unused input.
+.TP
+.B toggle
+Switch between on and off.
+.TP
+.B status
+Print the session count, the privacy state, what the desktop reports about
+the display, and the last error.
+.SH FILES
+.TP
+.I /etc/bg-vncPrivacy.conf
+Monitor serial number
+.RB ( [monitor]\ serial ),
+the input codes for the desk and private inputs
+.RB ( desk_input ,
+.BR private_input ;
+DDC/CI VCP feature 0x60) and the VNC port
+.RB ( [vnc]\ port ).
+.TP
+.I $XDG_RUNTIME_DIR/bg-vncPrivacy/
+State: session count, privacy state, last error.
+.TP
+.I /usr/local/bin/x11vnc-console
+x11vnc launcher; the installer adds the hooks to it.
+.SH EXAMPLES
+Find the values for the configuration file:
+.PP
+.nf
+.RS
+ddcutil detect
+ddcutil \-\-sn SERIAL capabilities
+ddcutil \-\-sn SERIAL getvcp 60
+.RE
+.fi
+.PP
+Rescue a monitor stuck on the private input, over ssh:
+.PP
+.RS
+.B ssh host bg-vncPrivacy off
+.RE
+.SH NOTES
+Changing the display's power state from software does not keep the monitor
+dark, because VNC input counts as user activity and GNOME wakes the display.
+Switching the monitor's input is not affected by that.
+.PP
+DDC/CI access comes from the
+.B ddcutil
+package's udev rule, which gives the user logged in at the console access to
+.IR /dev/i2c\-* .
+.SH BUGS
+At the login screen there is no top-bar item and no GNOME session to ask, so
+privacy never turns on automatically there.
+.PP
+GNOME's AppIndicator extension shows no hover tooltips, so the state is shown
+in the menu.
+.SH SEE ALSO
+.BR x11vnc (1),
+.BR ddcutil (1)

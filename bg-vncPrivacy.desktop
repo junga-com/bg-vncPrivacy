@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=bg-vncPrivacy
+Comment=Top-bar item that keeps the local monitor dark while working over VNC
+Exec=/usr/local/bin/bg-vncPrivacy tray
+Icon=bg-vncprivacy-monitor-symbolic
+OnlyShowIn=GNOME;Unity;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
